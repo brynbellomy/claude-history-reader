@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -15,26 +14,32 @@ type State int
 const (
 	StateFileList State = iota
 	StateViewer
-	StateSearch
 )
 
 type Model struct {
-	state              State
-	files              []FileInfo
-	fileIndex          int
-	rawContent         string // Plain JSON content (for searching)
-	highlightedContent string // Syntax-highlighted content
-	viewport           viewport.Model
-	searchQuery        string
-	searchInput        string
-	searchMode         bool
-	numBuffer          string // For vim number prefix (e.g., "10" in "10j")
-	width              int
-	height             int
-	ready              bool
-	err                error
-	lastKey            string // Track last key for "gg" detection
-	projectPath        string // Original project path (if viewing history for a project)
+	state       State
+	files       []FileInfo
+	fileIndex   int
+	projectPath string // Original project path (if viewing history for a project)
+
+	// Content
+	rawLines         []string // Raw JSON lines (for searching/preview)
+	highlightedLines []string // Syntax-highlighted lines
+
+	// Viewer state
+	cursorLine  int    // Current line (0-indexed)
+	scrollOffset int   // First visible line
+	searchQuery string
+	searchInput string
+	searchMode  bool
+	numBuffer   string // For vim number prefix (e.g., "10" in "10j")
+	lastKey     string // Track last key for "gg" detection
+
+	// Dimensions
+	width  int
+	height int
+	ready  bool
+	err    error
 }
 
 var (
@@ -54,6 +59,20 @@ var (
 
 	searchStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("214"))
+
+	cursorLineStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("236"))
+
+	lineNumberStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Width(6).
+			Align(lipgloss.Right)
+
+	lineNumberSelectedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214")).
+				Width(6).
+				Align(lipgloss.Right).
+				Bold(true)
 )
 
 func NewModel(files []FileInfo, projectPath string) Model {
@@ -70,9 +89,6 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-	var cmds []tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// Handle search mode input
@@ -91,27 +107,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-
-		headerHeight := 3
-		footerHeight := 2
-		verticalMargins := headerHeight + footerHeight
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-verticalMargins)
-			m.viewport.YPosition = headerHeight
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - verticalMargins
-		}
+		m.ready = true
 	}
 
-	if m.state == StateViewer {
-		m.viewport, cmd = m.viewport.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-
-	return m, tea.Batch(cmds...)
+	return m, nil
 }
 
 func (m Model) handleFileListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -136,10 +135,11 @@ func (m Model) handleFileListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.err = err
 				return m, nil
 			}
-			m.rawContent = content
-			m.highlightedContent = HighlightJSON(content)
-			m.viewport.SetContent(m.highlightedContent)
-			m.viewport.GotoTop()
+			m.rawLines = strings.Split(content, "\n")
+			highlighted := HighlightJSON(content)
+			m.highlightedLines = strings.Split(highlighted, "\n")
+			m.cursorLine = 0
+			m.scrollOffset = 0
 			m.state = StateViewer
 			m.searchQuery = ""
 		}
@@ -169,10 +169,10 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Handle number prefix for vim commands
 	if key >= "0" && key <= "9" {
-		// Don't allow leading zeros (except for "0" which could be a command)
 		if key == "0" && m.numBuffer == "" {
-			// "0" by itself - go to beginning of line (we'll treat as top)
-			m.viewport.GotoTop()
+			// "0" by itself - go to top
+			m.cursorLine = 0
+			m.ensureCursorVisible()
 			return m, nil
 		}
 		m.numBuffer += key
@@ -188,6 +188,8 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.numBuffer = ""
 	}
 
+	totalLines := len(m.rawLines)
+
 	switch key {
 	case "q":
 		m.state = StateFileList
@@ -197,10 +199,8 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		if m.searchQuery != "" {
-			// Clear search but stay in viewer
 			m.searchQuery = ""
 			m.searchInput = ""
-			m.updateViewportContent()
 			return m, nil
 		}
 		m.state = StateFileList
@@ -210,20 +210,42 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "j", "down":
-		m.viewport.ScrollDown(count)
+		m.cursorLine += count
+		if m.cursorLine >= totalLines {
+			m.cursorLine = totalLines - 1
+		}
+		if m.cursorLine < 0 {
+			m.cursorLine = 0
+		}
+		m.ensureCursorVisible()
 
 	case "k", "up":
-		m.viewport.ScrollUp(count)
+		m.cursorLine -= count
+		if m.cursorLine < 0 {
+			m.cursorLine = 0
+		}
+		m.ensureCursorVisible()
 
 	case "ctrl+d":
-		m.viewport.HalfPageDown()
+		viewHeight := m.viewerHeight()
+		m.cursorLine += viewHeight / 2
+		if m.cursorLine >= totalLines {
+			m.cursorLine = totalLines - 1
+		}
+		m.ensureCursorVisible()
 
 	case "ctrl+u":
-		m.viewport.HalfPageUp()
+		viewHeight := m.viewerHeight()
+		m.cursorLine -= viewHeight / 2
+		if m.cursorLine < 0 {
+			m.cursorLine = 0
+		}
+		m.ensureCursorVisible()
 
 	case "g":
 		if m.lastKey == "g" {
-			m.viewport.GotoTop()
+			m.cursorLine = 0
+			m.scrollOffset = 0
 			m.lastKey = ""
 		} else {
 			m.lastKey = "g"
@@ -231,7 +253,8 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "G":
-		m.viewport.GotoBottom()
+		m.cursorLine = totalLines - 1
+		m.ensureCursorVisible()
 
 	case "/":
 		m.searchMode = true
@@ -261,7 +284,6 @@ func (m Model) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		m.searchQuery = m.searchInput
 		m.searchMode = false
-		m.updateViewportContent()
 		if m.searchQuery != "" {
 			m.findNext(1)
 		}
@@ -270,8 +292,6 @@ func (m Model) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.searchMode = false
 		m.searchInput = ""
-		m.searchQuery = ""
-		m.updateViewportContent()
 		return m, nil
 
 	case "backspace":
@@ -281,7 +301,6 @@ func (m Model) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	default:
-		// Only add printable characters
 		if len(msg.String()) == 1 {
 			m.searchInput += msg.String()
 		}
@@ -289,13 +308,37 @@ func (m Model) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// updateViewportContent refreshes the viewport with syntax + search highlighting
-func (m *Model) updateViewportContent() {
-	content := m.highlightedContent
-	if m.searchQuery != "" {
-		content = HighlightSearch(content, m.searchQuery)
+// viewerHeight returns the number of visible lines in the viewer
+func (m Model) viewerHeight() int {
+	return m.height - 5 // header + divider + footer + padding
+}
+
+// leftPaneWidth returns the width of the JSON pane (left side)
+func (m Model) leftPaneWidth() int {
+	return m.width * 55 / 100 // 55% for JSON
+}
+
+// rightPaneWidth returns the width of the preview pane (right side)
+func (m Model) rightPaneWidth() int {
+	return m.width - m.leftPaneWidth() - 3 // 3 for separator
+}
+
+// ensureCursorVisible adjusts scroll to keep cursor in view
+func (m *Model) ensureCursorVisible() {
+	viewHeight := m.viewerHeight()
+	if viewHeight <= 0 {
+		viewHeight = 10
 	}
-	m.viewport.SetContent(content)
+
+	// If cursor is above visible area, scroll up
+	if m.cursorLine < m.scrollOffset {
+		m.scrollOffset = m.cursorLine
+	}
+
+	// If cursor is below visible area, scroll down
+	if m.cursorLine >= m.scrollOffset+viewHeight {
+		m.scrollOffset = m.cursorLine - viewHeight + 1
+	}
 }
 
 func (m *Model) findNext(direction int) {
@@ -303,21 +346,20 @@ func (m *Model) findNext(direction int) {
 		return
 	}
 
-	lines := strings.Split(m.rawContent, "\n")
-	currentLine := m.viewport.YOffset
-	totalLines := len(lines)
+	totalLines := len(m.rawLines)
+	queryLower := strings.ToLower(m.searchQuery)
 
-	// Search from current position
 	for i := 1; i <= totalLines; i++ {
 		var lineIdx int
 		if direction > 0 {
-			lineIdx = (currentLine + i) % totalLines
+			lineIdx = (m.cursorLine + i) % totalLines
 		} else {
-			lineIdx = (currentLine - i + totalLines) % totalLines
+			lineIdx = (m.cursorLine - i + totalLines) % totalLines
 		}
 
-		if strings.Contains(strings.ToLower(lines[lineIdx]), strings.ToLower(m.searchQuery)) {
-			m.viewport.SetYOffset(lineIdx)
+		if strings.Contains(strings.ToLower(m.rawLines[lineIdx]), queryLower) {
+			m.cursorLine = lineIdx
+			m.ensureCursorVisible()
 			return
 		}
 	}
@@ -385,23 +427,211 @@ func (m Model) viewViewer() string {
 	if m.searchQuery != "" {
 		header += "  " + searchStyle.Render(fmt.Sprintf("[/%s]", m.searchQuery))
 	}
-	b.WriteString(header)
+	lineInfo := helpStyle.Render(fmt.Sprintf("Line %d/%d", m.cursorLine+1, len(m.rawLines)))
+	headerPadding := m.width - lipgloss.Width(header) - lipgloss.Width(lineInfo)
+	if headerPadding < 1 {
+		headerPadding = 1
+	}
+	b.WriteString(header + strings.Repeat(" ", headerPadding) + lineInfo)
 	b.WriteString("\n")
 	b.WriteString(strings.Repeat("─", m.width))
 	b.WriteString("\n")
 
-	// Content
-	b.WriteString(m.viewport.View())
-	b.WriteString("\n")
+	// Two-column layout
+	leftWidth := m.leftPaneWidth()
+	rightWidth := m.rightPaneWidth()
+	viewHeight := m.viewerHeight()
+
+	// Build left pane (JSON with cursor)
+	leftLines := m.buildLeftPane(leftWidth, viewHeight)
+
+	// Build right pane (preview)
+	rightLines := m.buildRightPane(rightWidth, viewHeight)
+
+	// Combine columns
+	for i := 0; i < viewHeight; i++ {
+		leftLine := ""
+		if i < len(leftLines) {
+			leftLine = leftLines[i]
+		}
+		rightLine := ""
+		if i < len(rightLines) {
+			rightLine = rightLines[i]
+		}
+
+		// Pad left line to width
+		leftLine = padOrTruncate(leftLine, leftWidth)
+
+		b.WriteString(leftLine)
+		b.WriteString(" │ ")
+		b.WriteString(rightLine)
+		b.WriteString("\n")
+	}
 
 	// Footer
 	if m.searchMode {
 		b.WriteString(searchStyle.Render(fmt.Sprintf("/%s", m.searchInput)))
 	} else {
-		progress := fmt.Sprintf("%d%%", int(m.viewport.ScrollPercent()*100))
-		help := helpStyle.Render("j/k: scroll • /: search • n/N: next/prev • q: back")
+		progress := ""
+		if len(m.rawLines) > 0 {
+			pct := (m.cursorLine + 1) * 100 / len(m.rawLines)
+			progress = fmt.Sprintf("%d%%", pct)
+		}
+		help := helpStyle.Render("j/k: move • /: search • n/N: next/prev • q: back")
 		b.WriteString(fmt.Sprintf("%s  %s", progress, help))
 	}
 
 	return b.String()
+}
+
+// buildLeftPane builds the JSON viewer with cursor highlighting
+func (m Model) buildLeftPane(width, height int) []string {
+	var lines []string
+	lineNumWidth := 6
+
+	for i := 0; i < height; i++ {
+		lineIdx := m.scrollOffset + i
+		if lineIdx >= len(m.highlightedLines) {
+			lines = append(lines, "")
+			continue
+		}
+
+		// Line number
+		var lineNum string
+		if lineIdx == m.cursorLine {
+			lineNum = lineNumberSelectedStyle.Render(fmt.Sprintf("%d", lineIdx+1))
+		} else {
+			lineNum = lineNumberStyle.Render(fmt.Sprintf("%d", lineIdx+1))
+		}
+
+		// Content (use highlighted version, apply search highlighting if needed)
+		content := m.highlightedLines[lineIdx]
+		if m.searchQuery != "" {
+			content = HighlightSearch(content, m.searchQuery)
+		}
+
+		// Truncate content to fit
+		maxContentWidth := width - lineNumWidth - 2
+		content = truncateWithAnsi(content, maxContentWidth)
+
+		// Apply cursor line background
+		if lineIdx == m.cursorLine {
+			// Pad content and apply background
+			content = padOrTruncate(content, maxContentWidth)
+			content = cursorLineStyle.Render(content)
+		}
+
+		lines = append(lines, lineNum+" "+content)
+	}
+
+	return lines
+}
+
+// buildRightPane builds the preview pane
+func (m Model) buildRightPane(width, height int) []string {
+	if m.cursorLine >= len(m.rawLines) {
+		return []string{noPreviewStyle.Render("No content")}
+	}
+
+	// Get the current line's raw content
+	rawLine := m.rawLines[m.cursorLine]
+
+	// Try to extract and render a string value
+	preview := RenderPreview(rawLine, width-2) // -2 for padding
+
+	if !preview.IsString {
+		msg := noPreviewStyle.Render("(no string value)")
+		return centerLines([]string{msg}, height)
+	}
+
+	// Build preview content
+	var content strings.Builder
+
+	// Header
+	if preview.Key != "" {
+		content.WriteString(titleStyle.Render(preview.Key))
+	} else {
+		content.WriteString(titleStyle.Render("String Value"))
+	}
+	content.WriteString("\n")
+	content.WriteString(strings.Repeat("─", width-2))
+	content.WriteString("\n")
+
+	// Rendered content (already word-wrapped by glamour)
+	content.WriteString(preview.Rendered)
+
+	// Split into lines - glamour already handles word wrapping
+	lines := strings.Split(content.String(), "\n")
+
+	return lines
+}
+
+var noPreviewStyle = lipgloss.NewStyle().
+	Foreground(lipgloss.Color("241")).
+	Italic(true)
+
+// padOrTruncate ensures a string (with possible ANSI codes) fits exactly in width
+func padOrTruncate(s string, width int) string {
+	visible := lipgloss.Width(s)
+	if visible > width {
+		return truncateWithAnsi(s, width)
+	}
+	if visible < width {
+		return s + strings.Repeat(" ", width-visible)
+	}
+	return s
+}
+
+// truncateWithAnsi truncates a string with ANSI codes to a visible width
+func truncateWithAnsi(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+
+	var result strings.Builder
+	visibleWidth := 0
+	i := 0
+
+	for i < len(s) && visibleWidth < maxWidth {
+		// Check for ANSI escape sequence
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// Find end of sequence
+			j := i + 2
+			for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+				j++
+			}
+			if j < len(s) {
+				j++ // Include the final letter
+			}
+			result.WriteString(s[i:j])
+			i = j
+			continue
+		}
+
+		// Regular character
+		result.WriteByte(s[i])
+		visibleWidth++
+		i++
+	}
+
+	// Reset ANSI at end to be safe
+	result.WriteString("\x1b[0m")
+	return result.String()
+}
+
+// centerLines centers lines vertically
+func centerLines(lines []string, height int) []string {
+	if len(lines) >= height {
+		return lines[:height]
+	}
+
+	padding := (height - len(lines)) / 2
+	result := make([]string, height)
+	for i := 0; i < padding; i++ {
+		result[i] = ""
+	}
+	for i, line := range lines {
+		result[padding+i] = line
+	}
+	return result
 }
