@@ -16,19 +16,38 @@ const (
 	StateViewer
 )
 
+type ViewMode int
+
+const (
+	ViewModeJSON ViewMode = iota
+	ViewModeMessage
+)
+
 type Model struct {
 	state       State
 	files       []FileInfo
 	fileIndex   int
 	projectPath string // Original project path (if viewing history for a project)
 
-	// Content
+	// Content - JSON mode
 	rawLines         []string // Raw JSON lines (for searching/preview)
 	highlightedLines []string // Syntax-highlighted lines
 
-	// Viewer state
-	cursorLine  int    // Current line (0-indexed)
-	scrollOffset int   // First visible line
+	// Content - Message mode
+	messages     []Message // Parsed messages
+	messageIndex int       // Current message (0-indexed)
+
+	// View mode
+	viewMode ViewMode
+
+	// Viewer state (JSON mode)
+	cursorLine   int // Current line (0-indexed)
+	scrollOffset int // First visible line
+
+	// Viewer state (Message mode)
+	messageScrollOffset int // Scroll offset within rendered messages
+
+	// Shared state
 	searchQuery string
 	searchInput string
 	searchMode  bool
@@ -130,7 +149,10 @@ func (m Model) handleFileListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		if len(m.files) > 0 {
-			content, err := ParseJSONLFile(m.files[m.fileIndex].Path)
+			filePath := m.files[m.fileIndex].Path
+
+			// Parse for JSON mode
+			content, err := ParseJSONLFile(filePath)
 			if err != nil {
 				m.err = err
 				return m, nil
@@ -138,8 +160,21 @@ func (m Model) handleFileListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rawLines = strings.Split(content, "\n")
 			highlighted := HighlightJSON(content)
 			m.highlightedLines = strings.Split(highlighted, "\n")
+
+			// Parse for Message mode
+			messages, err := ParseJSONLMessages(filePath)
+			if err != nil {
+				m.err = err
+				return m, nil
+			}
+			m.messages = messages
+
+			// Reset state
 			m.cursorLine = 0
 			m.scrollOffset = 0
+			m.messageIndex = 0
+			m.messageScrollOffset = 0
+			m.viewMode = ViewModeMessage // Start in message mode
 			m.state = StateViewer
 			m.searchQuery = ""
 		}
@@ -167,12 +202,27 @@ func (m Model) handleFileListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
+	// Tab toggles view mode
+	if key == "tab" {
+		if m.viewMode == ViewModeJSON {
+			m.viewMode = ViewModeMessage
+		} else {
+			m.viewMode = ViewModeJSON
+		}
+		return m, nil
+	}
+
 	// Handle number prefix for vim commands
 	if key >= "0" && key <= "9" {
 		if key == "0" && m.numBuffer == "" {
 			// "0" by itself - go to top
-			m.cursorLine = 0
-			m.ensureCursorVisible()
+			if m.viewMode == ViewModeJSON {
+				m.cursorLine = 0
+				m.ensureCursorVisible()
+			} else {
+				m.messageIndex = 0
+				m.messageScrollOffset = 0
+			}
 			return m, nil
 		}
 		m.numBuffer += key
@@ -187,8 +237,6 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.numBuffer = ""
 	}
-
-	totalLines := len(m.rawLines)
 
 	switch key {
 	case "q":
@@ -210,42 +258,44 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "j", "down":
-		m.cursorLine += count
-		if m.cursorLine >= totalLines {
-			m.cursorLine = totalLines - 1
+		if m.viewMode == ViewModeJSON {
+			m.handleJSONNavigation(count, 1)
+		} else {
+			m.handleMessageNavigation(count, 1)
 		}
-		if m.cursorLine < 0 {
-			m.cursorLine = 0
-		}
-		m.ensureCursorVisible()
 
 	case "k", "up":
-		m.cursorLine -= count
-		if m.cursorLine < 0 {
-			m.cursorLine = 0
+		if m.viewMode == ViewModeJSON {
+			m.handleJSONNavigation(count, -1)
+		} else {
+			m.handleMessageNavigation(count, -1)
 		}
-		m.ensureCursorVisible()
 
 	case "ctrl+d":
 		viewHeight := m.viewerHeight()
-		m.cursorLine += viewHeight / 2
-		if m.cursorLine >= totalLines {
-			m.cursorLine = totalLines - 1
+		if m.viewMode == ViewModeJSON {
+			m.handleJSONNavigation(viewHeight/2, 1)
+		} else {
+			m.handleMessageNavigation(viewHeight/2, 1)
 		}
-		m.ensureCursorVisible()
 
 	case "ctrl+u":
 		viewHeight := m.viewerHeight()
-		m.cursorLine -= viewHeight / 2
-		if m.cursorLine < 0 {
-			m.cursorLine = 0
+		if m.viewMode == ViewModeJSON {
+			m.handleJSONNavigation(viewHeight/2, -1)
+		} else {
+			m.handleMessageNavigation(viewHeight/2, -1)
 		}
-		m.ensureCursorVisible()
 
 	case "g":
 		if m.lastKey == "g" {
-			m.cursorLine = 0
-			m.scrollOffset = 0
+			if m.viewMode == ViewModeJSON {
+				m.cursorLine = 0
+				m.scrollOffset = 0
+			} else {
+				m.messageIndex = 0
+				m.messageScrollOffset = 0
+			}
 			m.lastKey = ""
 		} else {
 			m.lastKey = "g"
@@ -253,8 +303,13 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "G":
-		m.cursorLine = totalLines - 1
-		m.ensureCursorVisible()
+		if m.viewMode == ViewModeJSON {
+			m.cursorLine = len(m.rawLines) - 1
+			m.ensureCursorVisible()
+		} else {
+			m.messageIndex = len(m.messages) - 1
+			m.messageScrollOffset = 0
+		}
 
 	case "/":
 		m.searchMode = true
@@ -277,6 +332,33 @@ func (m Model) handleViewerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *Model) handleJSONNavigation(count, direction int) {
+	totalLines := len(m.rawLines)
+	m.cursorLine += count * direction
+	if m.cursorLine >= totalLines {
+		m.cursorLine = totalLines - 1
+	}
+	if m.cursorLine < 0 {
+		m.cursorLine = 0
+	}
+	m.ensureCursorVisible()
+}
+
+func (m *Model) handleMessageNavigation(count, direction int) {
+	totalMessages := len(m.messages)
+	if totalMessages == 0 {
+		return
+	}
+	m.messageIndex += count * direction
+	if m.messageIndex >= totalMessages {
+		m.messageIndex = totalMessages - 1
+	}
+	if m.messageIndex < 0 {
+		m.messageIndex = 0
+	}
+	m.messageScrollOffset = 0 // Reset scroll when changing messages
 }
 
 func (m Model) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -374,7 +456,10 @@ func (m Model) View() string {
 	case StateFileList:
 		return m.viewFileList()
 	case StateViewer:
-		return m.viewViewer()
+		if m.viewMode == ViewModeMessage {
+			return m.viewMessageMode()
+		}
+		return m.viewJSONMode()
 	default:
 		return ""
 	}
@@ -415,7 +500,7 @@ func (m Model) viewFileList() string {
 	return b.String()
 }
 
-func (m Model) viewViewer() string {
+func (m Model) viewJSONMode() string {
 	var b strings.Builder
 
 	// Header
@@ -477,7 +562,7 @@ func (m Model) viewViewer() string {
 			pct := (m.cursorLine + 1) * 100 / len(m.rawLines)
 			progress = fmt.Sprintf("%d%%", pct)
 		}
-		help := helpStyle.Render("j/k: move • /: search • n/N: next/prev • q: back")
+		help := helpStyle.Render("j/k: move • Tab: message mode • /: search • q: back")
 		b.WriteString(fmt.Sprintf("%s  %s", progress, help))
 	}
 
@@ -634,4 +719,79 @@ func centerLines(lines []string, height int) []string {
 		result[padding+i] = line
 	}
 	return result
+}
+
+// viewMessageMode renders the message-focused view
+func (m Model) viewMessageMode() string {
+	var b strings.Builder
+
+	// Header
+	fileName := ""
+	if m.fileIndex < len(m.files) {
+		fileName = m.files[m.fileIndex].Name
+	}
+	header := titleStyle.Render(fileName)
+
+	// Message counter
+	msgInfo := ""
+	if len(m.messages) > 0 {
+		msgInfo = helpStyle.Render(fmt.Sprintf("Message %d/%d", m.messageIndex+1, len(m.messages)))
+	}
+
+	// Mode indicator
+	modeIndicator := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true).
+		Render("[MSG]")
+
+	headerPadding := m.width - lipgloss.Width(header) - lipgloss.Width(msgInfo) - lipgloss.Width(modeIndicator) - 2
+	if headerPadding < 1 {
+		headerPadding = 1
+	}
+	b.WriteString(header + strings.Repeat(" ", headerPadding) + msgInfo + " " + modeIndicator)
+	b.WriteString("\n")
+	b.WriteString(strings.Repeat("─", m.width))
+	b.WriteString("\n")
+
+	// Content area
+	viewHeight := m.viewerHeight()
+	contentWidth := m.width - 2
+
+	if len(m.messages) == 0 {
+		b.WriteString(helpStyle.Render("No messages to display"))
+	} else {
+		// Render current message
+		msg := m.messages[m.messageIndex]
+		rendered := msg.Render(contentWidth)
+		lines := strings.Split(rendered, "\n")
+
+		// Apply scroll offset and show visible lines
+		startLine := m.messageScrollOffset
+		if startLine >= len(lines) {
+			startLine = 0
+		}
+
+		for i := 0; i < viewHeight && startLine+i < len(lines); i++ {
+			b.WriteString(lines[startLine+i])
+			b.WriteString("\n")
+		}
+
+		// Fill remaining height
+		visibleLines := len(lines) - startLine
+		if visibleLines < viewHeight {
+			for i := visibleLines; i < viewHeight; i++ {
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	// Footer
+	if m.searchMode {
+		b.WriteString(searchStyle.Render(fmt.Sprintf("/%s", m.searchInput)))
+	} else {
+		help := helpStyle.Render("j/k: prev/next msg • Tab: JSON mode • gg/G: first/last • q: back")
+		b.WriteString(help)
+	}
+
+	return b.String()
 }
